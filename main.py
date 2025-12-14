@@ -211,8 +211,8 @@ async def send_visitor_message(chat_id: str, text: str, lang: str | None = None)
         return
 
     lang_label = (lang or "").upper() if lang else ""
-    prefix = f"[Auto-translated {lang_label}] " if lang_label else "[Auto-translated] "
-    display_text = prefix + text
+    # prefix = f"[Auto-translated {lang_label}] " if lang_label else "[Auto-translated] "
+    display_text = text
 
     url = f"{LIVECHAT_API_BASE}/agent/action/send_event"
     headers = {
