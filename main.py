@@ -138,6 +138,8 @@ async def translate_agent_reply_to_customer(agent_text: str, sample_customer_tex
                     "You translate English customer support replies so that they match BOTH the language "
                     "and the writing style of CUSTOMER_TEXT.\n"
                     "- First, detect the language of CUSTOMER_TEXT.\n"
+                    "- If AGENT_REPLY is already in the same language/script as CUSTOMER_TEXT, "
+                    "return AGENT_REPLY exactly as-is (no paraphrasing or edits).\n"
                     "- Then translate AGENT_REPLY into that language.\n"
                     "- VERY IMPORTANT: match the same script and format as CUSTOMER_TEXT.\n"
                     "  * If CUSTOMER_TEXT uses Latin letters (roman Urdu/Hindi like 'yar kahan ho'), "
