@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import time
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -42,10 +43,14 @@ openai_client = AsyncOpenAI(
     max_retries=OPENAI_MAX_RETRIES,
 )
 
-# simple in-memory state: chat_id -> { lang, sample }
+# simple in-memory state: chat_id -> { lang, script, sample }
 CHAT_STATE: dict[str, dict] = {}
 
 http_client: Optional[httpx.AsyncClient] = None
+
+LATIN_RE = re.compile(r"[A-Za-z]")
+ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 
 
 @asynccontextmanager
@@ -159,15 +164,63 @@ def safe_json_loads(text: str) -> Optional[dict]:
     return None
 
 
-async def detect_language_and_translate_to_english(text: str) -> tuple[str, str]:
+def detect_script(text: str) -> str:
+    latin = len(LATIN_RE.findall(text))
+    arabic = len(ARABIC_RE.findall(text))
+    devanagari = len(DEVANAGARI_RE.findall(text))
+
+    counts = {
+        "latin": latin,
+        "arabic": arabic,
+        "devanagari": devanagari,
+    }
+
+    best = max(counts, key=counts.get)
+    if counts[best] == 0:
+        return "other"
+    return best
+
+
+def matches_required_script(text: str, required_script: str) -> bool:
+    has_latin = bool(LATIN_RE.search(text))
+    has_arabic = bool(ARABIC_RE.search(text))
+    has_devanagari = bool(DEVANAGARI_RE.search(text))
+
+    if required_script == "latin":
+        return has_latin and not has_arabic and not has_devanagari
+
+    if required_script == "arabic":
+        return has_arabic and not has_devanagari
+
+    if required_script == "devanagari":
+        return has_devanagari and not has_arabic
+
+    return True
+
+
+def normalize_script_label(script: str) -> str:
+    s = (script or "").strip().lower()
+    if s in {"latin", "roman", "romanized", "roman urdu", "roman hindi"}:
+        return "latin"
+    if s in {"arabic", "urdu", "urdu script"}:
+        return "arabic"
+    if s in {"devanagari", "hindi", "hindi script"}:
+        return "devanagari"
+    return "other"
+
+
+async def detect_language_and_translate_to_english(text: str) -> tuple[str, str, str]:
     """
     Detect language and translate to English.
-    Returns (language_code, english_translation).
+    Returns (language_code, english_translation, script).
+    Script is determined deterministically in Python.
     """
     if not text.strip():
-        return "unknown", text
+        return "unknown", text, "other"
 
     start = time.perf_counter()
+    script = detect_script(text)
+
     try:
         resp = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -195,7 +248,7 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str]
         data = safe_json_loads(content)
         if not data:
             print("Failed to parse JSON from OpenAI")
-            return "unknown", text
+            return "unknown", text, script
 
         lang = (data.get("language") or "unknown").lower().strip()
         translation = (data.get("translation_en") or "").strip()
@@ -203,15 +256,15 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str]
         if not translation:
             translation = text
 
-        return lang, translation
+        return lang, translation, script
 
     except APITimeoutError as e:
         print("OpenAI timeout in detect_language_and_translate_to_english:", repr(e))
-        return "unknown", text
+        return "unknown", text, script
 
     except Exception as e:
         print("OpenAI error in detect_language_and_translate_to_english:", repr(e))
-        return "unknown", text
+        return "unknown", text, script
 
     finally:
         print(
@@ -220,14 +273,29 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str]
         )
 
 
-async def translate_agent_reply_to_customer(agent_text: str, sample_customer_text: str) -> str:
-    """
-    Translate agent reply into the same language/script/style as customer text.
-    """
-    if not agent_text.strip():
-        return agent_text
+async def repair_to_required_script(text: str, target_script: str, sample_customer_text: str) -> str:
+    if not text.strip():
+        return text
 
-    start = time.perf_counter()
+    script_instruction = {
+        "latin": (
+            "Rewrite the text using only Latin letters. "
+            "Do NOT use Arabic script. Do NOT use Devanagari. "
+            "Keep the meaning the same. "
+            "Use a natural romanized style similar to CUSTOMER_TEXT."
+        ),
+        "arabic": (
+            "Rewrite the text using Urdu/Arabic script. "
+            "Do NOT use Devanagari. "
+            "Avoid Latin transliteration except unavoidable brand names."
+        ),
+        "devanagari": (
+            "Rewrite the text using Devanagari/Hindi script. "
+            "Do NOT use Arabic script. "
+            "Avoid Latin transliteration except unavoidable brand names."
+        ),
+    }.get(target_script, "Rewrite the text preserving meaning.")
+
     try:
         resp = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -235,41 +303,146 @@ async def translate_agent_reply_to_customer(agent_text: str, sample_customer_tex
                 {
                     "role": "system",
                     "content": (
-                        "You translate English customer support replies so that they match BOTH the language "
-                        "and the writing style of CUSTOMER_TEXT.\n"
-                        "- First, detect the language of CUSTOMER_TEXT.\n"
-                        "- If AGENT_REPLY is already in the same language/script as CUSTOMER_TEXT, "
-                        "return AGENT_REPLY exactly as-is (no paraphrasing or edits).\n"
-                        "- Then translate AGENT_REPLY into that language.\n"
-                        "- VERY IMPORTANT: match the same script and format as CUSTOMER_TEXT.\n"
-                        "  * If CUSTOMER_TEXT uses Latin letters (roman Urdu/Hindi like 'yar kahan ho'), "
-                        "    your reply MUST also use Latin letters, not Arabic or Devanagari script.\n"
-                        "  * If CUSTOMER_TEXT uses a native script (Arabic, Devanagari, etc.), "
-                        "    reply in that script.\n"
-                        "- Keep a similar level of formality and style.\n"
-                        "Return ONLY the translated reply text. No comments, no explanations."
+                        f"{script_instruction}\n"
+                        "Return ONLY the rewritten text. No explanations."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"CUSTOMER_TEXT: {sample_customer_text}\n"
-                        f"AGENT_REPLY (English): {agent_text}"
+                        f"TEXT_TO_REWRITE: {text}"
                     ),
                 },
             ],
-            temperature=0.2,
+            temperature=0,
         )
-
-        translated = (resp.choices[0].message.content or "").strip()
-        return translated if translated else agent_text
-
-    except APITimeoutError as e:
-        print("OpenAI timeout in translate_agent_reply_to_customer:", repr(e))
-        return agent_text
+        repaired = (resp.choices[0].message.content or "").strip()
+        return repaired if repaired else text
 
     except Exception as e:
-        print("OpenAI error in translate_agent_reply_to_customer:", repr(e))
+        print("repair_to_required_script error:", repr(e))
+        return text
+
+
+async def translate_agent_reply_to_customer(
+    agent_text: str,
+    sample_customer_text: str,
+    target_lang: str,
+    target_script: str,
+) -> str:
+    """
+    Translate agent reply into the same language/script/style as customer text.
+    Wrong-script responses are rejected and retried.
+    """
+    if not agent_text.strip():
+        return agent_text
+
+    start = time.perf_counter()
+
+    target_script = normalize_script_label(target_script)
+
+    script_rule = {
+        "latin": (
+            "TARGET_SCRIPT is latin.\n"
+            "- Every word must be written using Latin letters only.\n"
+            "- Never output Arabic script.\n"
+            "- Never output Devanagari.\n"
+            "- Use natural romanized wording matching CUSTOMER_TEXT.\n"
+            "- Good example: 'main yahan hoon'\n"
+            "- Bad example: 'میں یہاں ہوں'\n"
+            "- Bad example: 'मैं यहाँ हूँ'\n"
+        ),
+        "arabic": (
+            "TARGET_SCRIPT is arabic.\n"
+            "- Output Urdu/Arabic script.\n"
+            "- Never output Devanagari.\n"
+            "- Avoid Latin transliteration except unavoidable brand names.\n"
+        ),
+        "devanagari": (
+            "TARGET_SCRIPT is devanagari.\n"
+            "- Output Hindi in Devanagari script.\n"
+            "- Never output Arabic script.\n"
+            "- Avoid Latin transliteration except unavoidable brand names.\n"
+        ),
+    }.get(target_script, "Match the script of CUSTOMER_TEXT exactly.\n")
+
+    try:
+        for attempt in range(3):
+            try:
+                resp = await openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a translation engine.\n"
+                                "Translate AGENT_REPLY into the same language as CUSTOMER_TEXT.\n"
+                                "You MUST obey the required script exactly.\n"
+                                f"TARGET_LANGUAGE: {target_lang}\n"
+                                f"TARGET_SCRIPT: {target_script}\n\n"
+                                f"{script_rule}\n"
+                                "Return ONLY valid JSON in this exact format:\n"
+                                "{"
+                                "\"translated_text\": \"...\", "
+                                "\"language\": \"...\", "
+                                "\"script\": \"latin|arabic|devanagari|other\""
+                                "}\n"
+                                "No markdown. No comments. No extra text."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"CUSTOMER_TEXT: {sample_customer_text}\n"
+                                f"AGENT_REPLY (English): {agent_text}"
+                            ),
+                        },
+                    ],
+                    temperature=0,
+                )
+
+                content = (resp.choices[0].message.content or "").strip()
+                print(f"OpenAI raw translate response attempt {attempt + 1}:", content)
+
+                data = safe_json_loads(content)
+                if not data:
+                    print("Failed to parse translate JSON; retrying")
+                    continue
+
+                translated = (data.get("translated_text") or "").strip()
+                returned_script = normalize_script_label(data.get("script") or "")
+
+                if not translated:
+                    print("Empty translated_text; retrying")
+                    continue
+
+                if matches_required_script(translated, target_script):
+                    return translated
+
+                print(
+                    "Script mismatch detected. "
+                    f"Required={target_script}, returned={returned_script}, text={translated}"
+                )
+
+                repaired = await repair_to_required_script(
+                    translated,
+                    target_script,
+                    sample_customer_text,
+                )
+
+                if repaired and matches_required_script(repaired, target_script):
+                    return repaired
+
+                print("Repair attempt still failed script validation; retrying")
+
+            except APITimeoutError as e:
+                print("OpenAI timeout in translate_agent_reply_to_customer:", repr(e))
+
+            except Exception as e:
+                print("OpenAI error in translate_agent_reply_to_customer attempt:", repr(e))
+
+        print("All translation attempts failed script validation; falling back to original agent text")
         return agent_text
 
     finally:
@@ -372,12 +545,14 @@ async def process_livechat_event(body: dict):
         if author_type == "visitor":
             print("Visitor message:", text)
 
-            lang, translated_en = await detect_language_and_translate_to_english(text)
+            lang, translated_en, script = await detect_language_and_translate_to_english(text)
             print(f"Detected language for chat {chat_id}: {lang}")
+            print(f"Detected script for chat {chat_id}: {script}")
             print("English translation:", translated_en)
 
             CHAT_STATE[chat_id] = {
                 "lang": lang,
+                "script": script,
                 "sample": text,
             }
 
@@ -397,14 +572,24 @@ async def process_livechat_event(body: dict):
                 return
 
             lang = chat_state.get("lang", "unknown")
+            script = chat_state.get("script", "other")
             sample = chat_state.get("sample", "")
 
             if lang == "en":
                 print("Chat language is English; not translating agent reply.")
                 return
 
-            translated_reply = await translate_agent_reply_to_customer(text, sample)
+            translated_reply = await translate_agent_reply_to_customer(
+                text,
+                sample,
+                lang,
+                script,
+            )
             print("Translated agent reply for visitor:", translated_reply)
+
+            if not matches_required_script(translated_reply, normalize_script_label(script)):
+                print("Blocked visitor message due to script mismatch after all attempts")
+                return
 
             ok = await send_visitor_message(chat_id, translated_reply, lang)
             print("Visitor message sent:", ok)
