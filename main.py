@@ -43,7 +43,10 @@ openai_client = AsyncOpenAI(
     max_retries=OPENAI_MAX_RETRIES,
 )
 
-# simple in-memory state: chat_id -> { lang, script, sample }
+# simple in-memory state: chat_id -> {
+#   lang, script, sample,
+#   recent_visitor_messages, recent_agent_messages
+# }
 CHAT_STATE: dict[str, dict] = {}
 
 http_client: Optional[httpx.AsyncClient] = None
@@ -51,6 +54,9 @@ http_client: Optional[httpx.AsyncClient] = None
 LATIN_RE = re.compile(r"[A-Za-z]")
 ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+MAX_RECENT_VISITOR_MESSAGES = 4
+MAX_RECENT_AGENT_MESSAGES = 4
 
 
 @asynccontextmanager
@@ -200,7 +206,7 @@ def matches_required_script(text: str, required_script: str) -> bool:
 
 def normalize_script_label(script: str) -> str:
     s = (script or "").strip().lower()
-    if s in {"latin", "roman", "romanized", "roman urdu", "roman hindi"}:
+    if s in {"latin", "roman", "romanized", "roman urdu", "roman hindi", "hinglish"}:
         return "latin"
     if s in {"arabic", "urdu", "urdu script"}:
         return "arabic"
@@ -209,7 +215,100 @@ def normalize_script_label(script: str) -> str:
     return "other"
 
 
-async def detect_language_and_translate_to_english(text: str) -> tuple[str, str, str]:
+def normalize_roman_support_text(text: str) -> str:
+    """
+    Light-touch cleanup only.
+    Avoid aggressive normalization that can distort meaning.
+    """
+    if not text:
+        return text
+
+    normalized = text
+
+    replacements = {
+        r"\bkaryea\b": "kariye",
+        r"\bkarayea\b": "kariye",
+        r"\bkriye\b": "kariye",
+        r"\bkriye\b": "kariye",
+        r"\bkarain\b": "karein",
+        r"\bkrain\b": "karein",
+        r"\bmatlb\b": "matlab",
+        r"\bplz\b": "please",
+        r"\bpls\b": "please",
+        r"\bthx\b": "thanks",
+        r"\brha\b": "raha",
+        r"\brhi\b": "rahi",
+        r"\bnhi\b": "nahi",
+        r"\bnai\b": "nahi",
+    }
+
+    for pattern, replacement in replacements.items():
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def get_or_create_chat_state(chat_id: str) -> dict:
+    state = CHAT_STATE.get(chat_id)
+    if state is None:
+        state = {
+            "lang": "unknown",
+            "script": "other",
+            "sample": "",
+            "recent_visitor_messages": [],
+            "recent_agent_messages": [],
+        }
+        CHAT_STATE[chat_id] = state
+    return state
+
+
+def append_recent_message(chat_id: str, author_type: str, text: str) -> None:
+    state = get_or_create_chat_state(chat_id)
+
+    if author_type == "visitor":
+        items = state.setdefault("recent_visitor_messages", [])
+        items.append(text)
+        if len(items) > MAX_RECENT_VISITOR_MESSAGES:
+            del items[:-MAX_RECENT_VISITOR_MESSAGES]
+
+    elif author_type == "agent":
+        items = state.setdefault("recent_agent_messages", [])
+        items.append(text)
+        if len(items) > MAX_RECENT_AGENT_MESSAGES:
+            del items[:-MAX_RECENT_AGENT_MESSAGES]
+
+
+def build_context_block(chat_id: str) -> str:
+    state = get_or_create_chat_state(chat_id)
+
+    visitor_msgs = state.get("recent_visitor_messages", [])
+    agent_msgs = state.get("recent_agent_messages", [])
+
+    lines = []
+    lines.append("RECENT CHAT CONTEXT:")
+
+    if not agent_msgs and not visitor_msgs:
+        lines.append("- none")
+        return "\n".join(lines)
+
+    if agent_msgs:
+        lines.append("Recent agent messages:")
+        for i, msg in enumerate(agent_msgs[-MAX_RECENT_AGENT_MESSAGES:], start=1):
+            lines.append(f"{i}. {msg}")
+
+    if visitor_msgs:
+        lines.append("Recent visitor messages:")
+        for i, msg in enumerate(visitor_msgs[-MAX_RECENT_VISITOR_MESSAGES:], start=1):
+            lines.append(f"{i}. {msg}")
+
+    return "\n".join(lines)
+
+
+async def detect_language_and_translate_to_english(
+    text: str,
+    chat_id: str,
+) -> tuple[str, str, str]:
     """
     Detect language and translate to English.
     Returns (language_code, english_translation, script).
@@ -220,6 +319,8 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str,
 
     start = time.perf_counter()
     script = detect_script(text)
+    normalized_text = normalize_roman_support_text(text)
+    context_block = build_context_block(chat_id)
 
     try:
         resp = await openai_client.chat.completions.create(
@@ -228,18 +329,50 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str,
                 {
                     "role": "system",
                     "content": (
-                        "You are a translation engine. "
-                        "Given a customer message, you must respond ONLY with valid JSON in this exact format:\n"
+                        "You are a highly careful customer-support translation engine.\n"
+                        "Your job is to translate noisy customer messages into English.\n\n"
+                        "The customer may write in:\n"
+                        "- English\n"
+                        "- Hindi\n"
+                        "- Urdu\n"
+                        "- Hinglish / Roman Hindi / Roman Urdu\n"
+                        "- mixed English + Roman Urdu/Hindi\n"
+                        "- typo-heavy, messy support-chat style text\n\n"
+                        "Important rules:\n"
+                        "- Return ONLY valid JSON.\n"
+                        "- Never add explanations outside JSON.\n"
+                        "- Detect the main language of the message.\n"
+                        "- Translate conservatively.\n"
+                        "- Use recent chat context to resolve short or ambiguous replies.\n"
+                        "- Do NOT invent game names, product names, or proper nouns unless clearly supported by context.\n"
+                        "- If a romanized token is ambiguous, prefer the grammatical meaning over treating it as a named entity.\n"
+                        "- Examples:\n"
+                        "  * 'kariye' usually means 'please do', not a product name.\n"
+                        "  * 'matlab' usually means 'what do you mean' or 'meaning'.\n"
+                        "  * 'ek number par jo hai' may refer to a previously mentioned option or first listed item.\n"
+                        "- Preserve the intended support meaning, not literal word-by-word nonsense.\n"
+                        "- If the message is already English, keep translation_en close to the original meaning.\n"
+                        "- If uncertain, still provide the most likely translation, but lower confidence.\n\n"
+                        "Return JSON in this exact shape:\n"
                         "{"
-                        "\"language\": \"<ISO 639-1 code like en, hi, ur, es>\", "
-                        "\"translation_en\": \"<English translation of the message>\""
-                        "}\n"
-                        "No extra text, no comments, no markdown."
+                        "\"language\": \"<ISO 639-1 code like en, hi, ur, id>\", "
+                        "\"translation_en\": \"<best English translation>\", "
+                        "\"confidence\": <number from 0 to 1>, "
+                        "\"ambiguous_tokens\": [\"...\", \"...\"]"
+                        "}"
                     ),
                 },
-                {"role": "user", "content": text},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{context_block}\n\n"
+                        f"RAW_CUSTOMER_TEXT: {text}\n"
+                        f"NORMALIZED_HINT_TEXT: {normalized_text}\n"
+                        f"DETECTED_SCRIPT_BY_SYSTEM: {script}"
+                    ),
+                },
             ],
-            temperature=0.1,
+            temperature=0,
         )
 
         content = (resp.choices[0].message.content or "").strip()
@@ -252,9 +385,14 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str,
 
         lang = (data.get("language") or "unknown").lower().strip()
         translation = (data.get("translation_en") or "").strip()
+        confidence = data.get("confidence")
+        ambiguous_tokens = data.get("ambiguous_tokens") or []
 
         if not translation:
             translation = text
+
+        print("Visitor translation confidence:", confidence)
+        print("Visitor translation ambiguous_tokens:", ambiguous_tokens)
 
         return lang, translation, script
 
@@ -273,16 +411,81 @@ async def detect_language_and_translate_to_english(text: str) -> tuple[str, str,
         )
 
 
-async def repair_to_required_script(text: str, target_script: str, sample_customer_text: str) -> str:
+async def translate_to_indonesian(text: str, chat_id: str) -> str:
+    """
+    Translate message into Indonesian for agent-only internal note.
+    Uses recent chat context for short or ambiguous messages.
+    """
     if not text.strip():
         return text
+
+    start = time.perf_counter()
+    normalized_text = normalize_roman_support_text(text)
+    context_block = build_context_block(chat_id)
+
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful translation engine for customer-support chats.\n"
+                        "Translate the message into natural Indonesian.\n\n"
+                        "Rules:\n"
+                        "- Use recent chat context to interpret short replies and ambiguous words.\n"
+                        "- The source may be English, Hindi, Urdu, Hinglish, Roman Urdu, or mixed text.\n"
+                        "- Do NOT invent proper nouns.\n"
+                        "- Do NOT over-literalize messy chat language.\n"
+                        "- Preserve the support meaning clearly and naturally.\n"
+                        "- Return ONLY the Indonesian translation text.\n"
+                        "- No comments. No markdown."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{context_block}\n\n"
+                        f"RAW_TEXT: {text}\n"
+                        f"NORMALIZED_HINT_TEXT: {normalized_text}"
+                    ),
+                },
+            ],
+            temperature=0,
+        )
+
+        translated = (resp.choices[0].message.content or "").strip()
+        return translated if translated else text
+
+    except APITimeoutError as e:
+        print("OpenAI timeout in translate_to_indonesian:", repr(e))
+        return text
+
+    except Exception as e:
+        print("OpenAI error in translate_to_indonesian:", repr(e))
+        return text
+
+    finally:
+        print(f"translate_to_indonesian took {time.perf_counter() - start:.2f}s")
+
+
+async def repair_to_required_script(
+    text: str,
+    target_script: str,
+    sample_customer_text: str,
+    chat_id: str,
+) -> str:
+    if not text.strip():
+        return text
+
+    context_block = build_context_block(chat_id)
 
     script_instruction = {
         "latin": (
             "Rewrite the text using only Latin letters. "
             "Do NOT use Arabic script. Do NOT use Devanagari. "
-            "Keep the meaning the same. "
-            "Use a natural romanized style similar to CUSTOMER_TEXT."
+            "Keep meaning the same. "
+            "Use natural romanized wording similar to CUSTOMER_TEXT."
         ),
         "arabic": (
             "Rewrite the text using Urdu/Arabic script. "
@@ -304,12 +507,14 @@ async def repair_to_required_script(text: str, target_script: str, sample_custom
                     "role": "system",
                     "content": (
                         f"{script_instruction}\n"
+                        "Use recent chat context only to preserve intended meaning.\n"
                         "Return ONLY the rewritten text. No explanations."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
+                        f"{context_block}\n\n"
                         f"CUSTOMER_TEXT: {sample_customer_text}\n"
                         f"TEXT_TO_REWRITE: {text}"
                     ),
@@ -330,6 +535,7 @@ async def translate_agent_reply_to_customer(
     sample_customer_text: str,
     target_lang: str,
     target_script: str,
+    chat_id: str,
 ) -> str:
     """
     Translate agent reply into the same language/script/style as customer text.
@@ -341,6 +547,7 @@ async def translate_agent_reply_to_customer(
     start = time.perf_counter()
 
     target_script = normalize_script_label(target_script)
+    context_block = build_context_block(chat_id)
 
     script_rule = {
         "latin": (
@@ -348,7 +555,8 @@ async def translate_agent_reply_to_customer(
             "- Every word must be written using Latin letters only.\n"
             "- Never output Arabic script.\n"
             "- Never output Devanagari.\n"
-            "- Use natural romanized wording matching CUSTOMER_TEXT.\n"
+            "- Use natural Roman Urdu / Roman Hindi / Hinglish style that matches CUSTOMER_TEXT.\n"
+            "- Keep the wording readable and normal for chat.\n"
             "- Good example: 'main yahan hoon'\n"
             "- Bad example: 'میں یہاں ہوں'\n"
             "- Bad example: 'मैं यहाँ हूँ'\n"
@@ -376,12 +584,19 @@ async def translate_agent_reply_to_customer(
                         {
                             "role": "system",
                             "content": (
-                                "You are a translation engine.\n"
+                                "You are a highly careful customer-support translation engine.\n"
                                 "Translate AGENT_REPLY into the same language as CUSTOMER_TEXT.\n"
                                 "You MUST obey the required script exactly.\n"
+                                "Use recent chat context to keep the reply aligned with the ongoing conversation.\n\n"
                                 f"TARGET_LANGUAGE: {target_lang}\n"
                                 f"TARGET_SCRIPT: {target_script}\n\n"
                                 f"{script_rule}\n"
+                                "Important rules:\n"
+                                "- Keep the original customer-support meaning intact.\n"
+                                "- Do not make the reply more dramatic or more formal than needed.\n"
+                                "- If the customer's sample is romanized, keep the reply romanized.\n"
+                                "- For latin target script, do not suddenly switch into Hindi or Urdu script.\n"
+                                "- Preserve clarity for deposit, payment, verification, support, and UPI-related messages.\n\n"
                                 "Return ONLY valid JSON in this exact format:\n"
                                 "{"
                                 "\"translated_text\": \"...\", "
@@ -394,6 +609,7 @@ async def translate_agent_reply_to_customer(
                         {
                             "role": "user",
                             "content": (
+                                f"{context_block}\n\n"
                                 f"CUSTOMER_TEXT: {sample_customer_text}\n"
                                 f"AGENT_REPLY (English): {agent_text}"
                             ),
@@ -429,6 +645,7 @@ async def translate_agent_reply_to_customer(
                     translated,
                     target_script,
                     sample_customer_text,
+                    chat_id,
                 )
 
                 if repaired and matches_required_script(repaired, target_script):
@@ -505,6 +722,19 @@ async def send_agent_only_message(chat_id: str, text: str) -> bool:
     return await post_livechat_event(payload, "send_agent_only_message")
 
 
+async def send_agent_only_message_id(chat_id: str, text: str) -> bool:
+    payload = {
+        "chat_id": chat_id,
+        "event": {
+            "type": "message",
+            "text": f"[ID] {text}",
+            "visibility": "agents",
+            "custom_id": "translator-bot",
+        },
+    }
+    return await post_livechat_event(payload, "send_agent_only_message_id")
+
+
 async def send_visitor_message(chat_id: str, text: str, lang: str | None = None) -> bool:
     payload = {
         "chat_id": chat_id,
@@ -541,24 +771,34 @@ async def process_livechat_event(body: dict):
         author_type = classify_author(author_id, event)
         print(f"Author {author_id} classified as: {author_type}")
 
+        append_recent_message(chat_id, author_type, text)
+
         # VISITOR FLOW
         if author_type == "visitor":
             print("Visitor message:", text)
 
-            lang, translated_en, script = await detect_language_and_translate_to_english(text)
+            lang, translated_en, script = await detect_language_and_translate_to_english(
+                text,
+                chat_id,
+            )
             print(f"Detected language for chat {chat_id}: {lang}")
             print(f"Detected script for chat {chat_id}: {script}")
             print("English translation:", translated_en)
 
-            CHAT_STATE[chat_id] = {
-                "lang": lang,
-                "script": script,
-                "sample": text,
-            }
+            state = get_or_create_chat_state(chat_id)
+            state["lang"] = lang
+            state["script"] = script
+            state["sample"] = text
 
             if lang != "en":
-                ok = await send_agent_only_message(chat_id, translated_en)
-                print("Agent-only note sent:", ok)
+                ok_en = await send_agent_only_message(chat_id, translated_en)
+                print("Agent-only EN note sent:", ok_en)
+
+                translated_id = await translate_to_indonesian(text, chat_id)
+                print("Indonesian translation:", translated_id)
+
+                ok_id = await send_agent_only_message_id(chat_id, translated_id)
+                print("Agent-only ID note sent:", ok_id)
 
             return
 
@@ -584,8 +824,15 @@ async def process_livechat_event(body: dict):
                 sample,
                 lang,
                 script,
+                chat_id,
             )
             print("Translated agent reply for visitor:", translated_reply)
+
+            translated_id = await translate_to_indonesian(text, chat_id)
+            print("Agent message Indonesian translation:", translated_id)
+
+            ok_id = await send_agent_only_message_id(chat_id, translated_id)
+            print("Agent-only ID note sent for agent message:", ok_id)
 
             if not matches_required_script(translated_reply, normalize_script_label(script)):
                 print("Blocked visitor message due to script mismatch after all attempts")
