@@ -43,10 +43,7 @@ openai_client = AsyncOpenAI(
     max_retries=OPENAI_MAX_RETRIES,
 )
 
-# simple in-memory state: chat_id -> {
-#   lang, script, sample,
-#   recent_visitor_messages, recent_agent_messages
-# }
+# simple in-memory state per chat
 CHAT_STATE: dict[str, dict] = {}
 
 http_client: Optional[httpx.AsyncClient] = None
@@ -57,6 +54,38 @@ DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 
 MAX_RECENT_VISITOR_MESSAGES = 4
 MAX_RECENT_AGENT_MESSAGES = 4
+MAX_RECENT_VISITOR_DETECTIONS = 6
+
+GENERIC_ENGLISH_SHORT_MESSAGES = {
+    "ok",
+    "okay",
+    "yes",
+    "no",
+    "done",
+    "sent",
+    "already sent",
+    "please check",
+    "please check fast",
+    "check fast",
+    "check now",
+    "why",
+    "why delay",
+    "same issue",
+    "first one",
+    "second one",
+    "third one",
+    "screenshot sent",
+    "ss sent",
+    "please help",
+    "fast",
+    "wait",
+    "not yet",
+    "now",
+    "same",
+    "first",
+    "second",
+    "third",
+}
 
 
 @asynccontextmanager
@@ -127,9 +156,6 @@ async def test_openai():
 
 
 def classify_author(author_id: str, event: dict | None = None) -> str:
-    """
-    Keeps your original idea, with a couple of safe fallbacks if available.
-    """
     if not author_id:
         return "unknown"
 
@@ -146,7 +172,6 @@ def classify_author(author_id: str, event: dict | None = None) -> str:
     if possible_type in {"customer", "visitor"}:
         return "visitor"
 
-    # original rule
     if "@" in author_id:
         return "agent"
 
@@ -216,10 +241,6 @@ def normalize_script_label(script: str) -> str:
 
 
 def normalize_roman_support_text(text: str) -> str:
-    """
-    Light-touch cleanup only.
-    Avoid aggressive normalization that can distort meaning.
-    """
     if not text:
         return text
 
@@ -228,7 +249,6 @@ def normalize_roman_support_text(text: str) -> str:
     replacements = {
         r"\bkaryea\b": "kariye",
         r"\bkarayea\b": "kariye",
-        r"\bkriye\b": "kariye",
         r"\bkriye\b": "kariye",
         r"\bkarain\b": "karein",
         r"\bkrain\b": "karein",
@@ -253,11 +273,12 @@ def get_or_create_chat_state(chat_id: str) -> dict:
     state = CHAT_STATE.get(chat_id)
     if state is None:
         state = {
-            "lang": "unknown",
-            "script": "other",
+            "lang": "unknown",  # effective dominant lang
+            "script": "other",  # effective dominant script
             "sample": "",
             "recent_visitor_messages": [],
             "recent_agent_messages": [],
+            "recent_visitor_detections": [],
         }
         CHAT_STATE[chat_id] = state
     return state
@@ -285,8 +306,7 @@ def build_context_block(chat_id: str) -> str:
     visitor_msgs = state.get("recent_visitor_messages", [])
     agent_msgs = state.get("recent_agent_messages", [])
 
-    lines = []
-    lines.append("RECENT CHAT CONTEXT:")
+    lines = ["RECENT CHAT CONTEXT:"]
 
     if not agent_msgs and not visitor_msgs:
         lines.append("- none")
@@ -305,14 +325,177 @@ def build_context_block(chat_id: str) -> str:
     return "\n".join(lines)
 
 
+def is_short_generic_english_message(text: str) -> bool:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return False
+
+    raw = re.sub(r"\s+", " ", raw)
+
+    if raw in GENERIC_ENGLISH_SHORT_MESSAGES:
+        return True
+
+    if not raw.isascii():
+        return False
+
+    words = raw.split()
+    if len(words) <= 3:
+        return True
+
+    if len(words) <= 5 and all(ch.isalnum() or ch.isspace() or ch in "?.!," for ch in raw):
+        return raw in GENERIC_ENGLISH_SHORT_MESSAGES or any(
+            phrase in raw
+            for phrase in [
+                "please check",
+                "already sent",
+                "check fast",
+                "first one",
+                "second one",
+                "same issue",
+                "please help",
+                "why delay",
+            ]
+        )
+
+    return False
+
+
+def append_visitor_detection(
+    chat_id: str,
+    detected_lang: str,
+    detected_script: str,
+    text: str,
+) -> None:
+    state = get_or_create_chat_state(chat_id)
+    items = state.setdefault("recent_visitor_detections", [])
+    items.append(
+        {
+            "lang": (detected_lang or "unknown").lower().strip(),
+            "script": normalize_script_label(detected_script),
+            "text": text,
+            "is_short_generic_english": is_short_generic_english_message(text),
+        }
+    )
+    if len(items) > MAX_RECENT_VISITOR_DETECTIONS:
+        del items[:-MAX_RECENT_VISITOR_DETECTIONS]
+
+
+def find_last_non_english_detection(detections: list[dict]) -> Optional[dict]:
+    for item in reversed(detections):
+        lang = (item.get("lang") or "").lower().strip()
+        if lang not in {"", "unknown", "en"}:
+            return item
+    return None
+
+
+def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
+    """
+    Dominant language logic:
+    - do not let one short English message flip the whole chat to English
+    - preserve prior non-English preference unless recent visitor behavior clearly changes
+    Returns: (effective_lang, effective_script, effective_sample)
+    """
+    state = get_or_create_chat_state(chat_id)
+    detections = state.get("recent_visitor_detections", [])
+
+    if not detections:
+        return "unknown", "other", ""
+
+    latest = detections[-1]
+    latest_lang = (latest.get("lang") or "unknown").lower().strip()
+    latest_script = normalize_script_label(latest.get("script") or "other")
+    latest_text = latest.get("text") or ""
+
+    # If latest message is clearly non-English, trust it immediately.
+    if latest_lang not in {"unknown", "en"}:
+        return latest_lang, latest_script, latest_text
+
+    last_non_en = find_last_non_english_detection(detections)
+
+    # If latest message is English but short/generic, preserve previous non-English preference.
+    if latest_lang == "en" and latest.get("is_short_generic_english") and last_non_en:
+        return (
+            last_non_en.get("lang") or "unknown",
+            normalize_script_label(last_non_en.get("script") or "other"),
+            last_non_en.get("text") or latest_text,
+        )
+
+    # If there are two most recent meaningful English messages in a row, allow switch to English.
+    if len(detections) >= 2:
+        last_two = detections[-2:]
+        if all(
+            (item.get("lang") or "").lower().strip() == "en"
+            and not item.get("is_short_generic_english")
+            for item in last_two
+        ):
+            return "en", "latin", latest_text
+
+    # Weighted voting across recent visitor detections.
+    lang_scores: dict[str, float] = {}
+    best_non_en_candidate: Optional[dict] = None
+
+    total = len(detections)
+    for idx, item in enumerate(detections):
+        lang = (item.get("lang") or "unknown").lower().strip()
+        text = item.get("text") or ""
+        is_short_en = bool(item.get("is_short_generic_english"))
+
+        weight = float(idx + 1) / float(total)
+
+        if lang == "unknown":
+            weight *= 0.25
+        elif lang == "en" and is_short_en:
+            weight *= 0.2
+
+        lang_scores[lang] = lang_scores.get(lang, 0.0) + weight
+
+        if lang not in {"unknown", "en"}:
+            best_non_en_candidate = item
+
+    best_lang = max(lang_scores, key=lang_scores.get)
+    best_lang_score = lang_scores.get(best_lang, 0.0)
+    non_en_score = sum(
+        score for lang, score in lang_scores.items() if lang not in {"unknown", "en"}
+    )
+    en_score = lang_scores.get("en", 0.0)
+
+    # If English barely wins but there is a recent non-English preference, keep non-English.
+    if best_lang == "en" and best_non_en_candidate:
+        if non_en_score > 0 and en_score < non_en_score * 1.5:
+            return (
+                best_non_en_candidate.get("lang") or "unknown",
+                normalize_script_label(best_non_en_candidate.get("script") or "other"),
+                best_non_en_candidate.get("text") or latest_text,
+            )
+
+    if best_lang in {"unknown", ""} and last_non_en:
+        return (
+            last_non_en.get("lang") or "unknown",
+            normalize_script_label(last_non_en.get("script") or "other"),
+            last_non_en.get("text") or latest_text,
+        )
+
+    if best_lang == "en":
+        return "en", "latin", latest_text
+
+    # for non-English dominant language, use most recent detection of that language
+    for item in reversed(detections):
+        if (item.get("lang") or "").lower().strip() == best_lang:
+            return (
+                best_lang,
+                normalize_script_label(item.get("script") or "other"),
+                item.get("text") or latest_text,
+            )
+
+    return latest_lang, latest_script, latest_text
+
+
 async def detect_language_and_translate_to_english(
     text: str,
     chat_id: str,
 ) -> tuple[str, str, str]:
     """
-    Detect language and translate to English.
-    Returns (language_code, english_translation, script).
-    Script is determined deterministically in Python.
+    Returns (detected_language_code, english_translation, detected_script)
     """
     if not text.strip():
         return "unknown", text, "other"
@@ -331,28 +514,15 @@ async def detect_language_and_translate_to_english(
                     "content": (
                         "You are a highly careful customer-support translation engine.\n"
                         "Your job is to translate noisy customer messages into English.\n\n"
-                        "The customer may write in:\n"
-                        "- English\n"
-                        "- Hindi\n"
-                        "- Urdu\n"
-                        "- Hinglish / Roman Hindi / Roman Urdu\n"
-                        "- mixed English + Roman Urdu/Hindi\n"
-                        "- typo-heavy, messy support-chat style text\n\n"
+                        "The customer may write in English, Hindi, Urdu, Hinglish, Roman Hindi, Roman Urdu, "
+                        "or mixed English + roman text.\n\n"
                         "Important rules:\n"
                         "- Return ONLY valid JSON.\n"
-                        "- Never add explanations outside JSON.\n"
-                        "- Detect the main language of the message.\n"
-                        "- Translate conservatively.\n"
                         "- Use recent chat context to resolve short or ambiguous replies.\n"
                         "- Do NOT invent game names, product names, or proper nouns unless clearly supported by context.\n"
                         "- If a romanized token is ambiguous, prefer the grammatical meaning over treating it as a named entity.\n"
-                        "- Examples:\n"
-                        "  * 'kariye' usually means 'please do', not a product name.\n"
-                        "  * 'matlab' usually means 'what do you mean' or 'meaning'.\n"
-                        "  * 'ek number par jo hai' may refer to a previously mentioned option or first listed item.\n"
-                        "- Preserve the intended support meaning, not literal word-by-word nonsense.\n"
-                        "- If the message is already English, keep translation_en close to the original meaning.\n"
-                        "- If uncertain, still provide the most likely translation, but lower confidence.\n\n"
+                        "- Translate conservatively and naturally.\n"
+                        "- If already English, keep the meaning clear.\n\n"
                         "Return JSON in this exact shape:\n"
                         "{"
                         "\"language\": \"<ISO 639-1 code like en, hi, ur, id>\", "
@@ -412,10 +582,6 @@ async def detect_language_and_translate_to_english(
 
 
 async def translate_to_indonesian(text: str, chat_id: str) -> str:
-    """
-    Translate message into Indonesian for agent-only internal note.
-    Uses recent chat context for short or ambiguous messages.
-    """
     if not text.strip():
         return text
 
@@ -436,7 +602,6 @@ async def translate_to_indonesian(text: str, chat_id: str) -> str:
                         "- Use recent chat context to interpret short replies and ambiguous words.\n"
                         "- The source may be English, Hindi, Urdu, Hinglish, Roman Urdu, or mixed text.\n"
                         "- Do NOT invent proper nouns.\n"
-                        "- Do NOT over-literalize messy chat language.\n"
                         "- Preserve the support meaning clearly and naturally.\n"
                         "- Return ONLY the Indonesian translation text.\n"
                         "- No comments. No markdown."
@@ -537,10 +702,6 @@ async def translate_agent_reply_to_customer(
     target_script: str,
     chat_id: str,
 ) -> str:
-    """
-    Translate agent reply into the same language/script/style as customer text.
-    Wrong-script responses are rejected and retried.
-    """
     if not agent_text.strip():
         return agent_text
 
@@ -557,9 +718,6 @@ async def translate_agent_reply_to_customer(
             "- Never output Devanagari.\n"
             "- Use natural Roman Urdu / Roman Hindi / Hinglish style that matches CUSTOMER_TEXT.\n"
             "- Keep the wording readable and normal for chat.\n"
-            "- Good example: 'main yahan hoon'\n"
-            "- Bad example: 'میں یہاں ہوں'\n"
-            "- Bad example: 'मैं यहाँ हूँ'\n"
         ),
         "arabic": (
             "TARGET_SCRIPT is arabic.\n"
@@ -593,8 +751,7 @@ async def translate_agent_reply_to_customer(
                                 f"{script_rule}\n"
                                 "Important rules:\n"
                                 "- Keep the original customer-support meaning intact.\n"
-                                "- Do not make the reply more dramatic or more formal than needed.\n"
-                                "- If the customer's sample is romanized, keep the reply romanized.\n"
+                                "- If the customer's style is romanized, keep the reply romanized.\n"
                                 "- For latin target script, do not suddenly switch into Hindi or Urdu script.\n"
                                 "- Preserve clarity for deposit, payment, verification, support, and UPI-related messages.\n\n"
                                 "Return ONLY valid JSON in this exact format:\n"
@@ -777,20 +934,28 @@ async def process_livechat_event(body: dict):
         if author_type == "visitor":
             print("Visitor message:", text)
 
-            lang, translated_en, script = await detect_language_and_translate_to_english(
+            detected_lang, translated_en, detected_script = await detect_language_and_translate_to_english(
                 text,
                 chat_id,
             )
-            print(f"Detected language for chat {chat_id}: {lang}")
-            print(f"Detected script for chat {chat_id}: {script}")
+            print(f"Detected language for chat {chat_id}: {detected_lang}")
+            print(f"Detected script for chat {chat_id}: {detected_script}")
             print("English translation:", translated_en)
 
-            state = get_or_create_chat_state(chat_id)
-            state["lang"] = lang
-            state["script"] = script
-            state["sample"] = text
+            append_visitor_detection(chat_id, detected_lang, detected_script, text)
 
-            if lang != "en":
+            effective_lang, effective_script, effective_sample = compute_effective_language_and_script(chat_id)
+            print(f"Effective dominant language for chat {chat_id}: {effective_lang}")
+            print(f"Effective dominant script for chat {chat_id}: {effective_script}")
+            print(f"Effective sample for chat {chat_id}: {effective_sample}")
+
+            state = get_or_create_chat_state(chat_id)
+            state["lang"] = effective_lang
+            state["script"] = effective_script
+            state["sample"] = effective_sample or text
+
+            # Keep current behavior pattern: internal EN/ID notes only for non-English detected messages.
+            if detected_lang != "en":
                 ok_en = await send_agent_only_message(chat_id, translated_en)
                 print("Agent-only EN note sent:", ok_en)
 
@@ -815,8 +980,9 @@ async def process_livechat_event(body: dict):
             script = chat_state.get("script", "other")
             sample = chat_state.get("sample", "")
 
+            # With dominant language logic, only skip if chat is truly dominant-English.
             if lang == "en":
-                print("Chat language is English; not translating agent reply.")
+                print("Dominant chat language is English; not translating agent reply.")
                 return
 
             translated_reply = await translate_agent_reply_to_customer(
@@ -878,7 +1044,6 @@ async def livechat_webhook(request: Request, background_tasks: BackgroundTasks):
             print("Ignoring translator-bot message to avoid loop")
             return JSONResponse({"ok": True})
 
-        # Return immediately; do the actual work in background
         background_tasks.add_task(process_livechat_event, body)
         return JSONResponse({"ok": True})
 
