@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import base64
@@ -273,11 +274,9 @@ def get_or_create_chat_state(chat_id: str) -> dict:
     state = CHAT_STATE.get(chat_id)
     if state is None:
         state = {
-            "lang": "unknown",  # effective dominant client language
-            "script": "other",  # effective dominant client script
+            "lang": "unknown",  # effective dominant lang
+            "script": "other",  # effective dominant script
             "sample": "",
-            "agent_lang": "en",  # agent preferred language
-            "agent_lang_locked": False,
             "recent_visitor_messages": [],
             "recent_agent_messages": [],
             "recent_visitor_detections": [],
@@ -392,7 +391,10 @@ def find_last_non_english_detection(detections: list[dict]) -> Optional[dict]:
 
 def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
     """
-    Dominant client language logic.
+    Dominant language logic:
+    - do not let one short English message flip the whole chat to English
+    - preserve prior non-English preference unless recent visitor behavior clearly changes
+    Returns: (effective_lang, effective_script, effective_sample)
     """
     state = get_or_create_chat_state(chat_id)
     detections = state.get("recent_visitor_detections", [])
@@ -405,11 +407,13 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
     latest_script = normalize_script_label(latest.get("script") or "other")
     latest_text = latest.get("text") or ""
 
+    # If latest message is clearly non-English, trust it immediately.
     if latest_lang not in {"unknown", "en"}:
         return latest_lang, latest_script, latest_text
 
     last_non_en = find_last_non_english_detection(detections)
 
+    # If latest message is English but short/generic, preserve previous non-English preference.
     if latest_lang == "en" and latest.get("is_short_generic_english") and last_non_en:
         return (
             last_non_en.get("lang") or "unknown",
@@ -417,6 +421,7 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
             last_non_en.get("text") or latest_text,
         )
 
+    # If there are two most recent meaningful English messages in a row, allow switch to English.
     if len(detections) >= 2:
         last_two = detections[-2:]
         if all(
@@ -426,12 +431,14 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
         ):
             return "en", "latin", latest_text
 
+    # Weighted voting across recent visitor detections.
     lang_scores: dict[str, float] = {}
     best_non_en_candidate: Optional[dict] = None
 
     total = len(detections)
     for idx, item in enumerate(detections):
         lang = (item.get("lang") or "unknown").lower().strip()
+        text = item.get("text") or ""
         is_short_en = bool(item.get("is_short_generic_english"))
 
         weight = float(idx + 1) / float(total)
@@ -447,11 +454,13 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
             best_non_en_candidate = item
 
     best_lang = max(lang_scores, key=lang_scores.get)
+    best_lang_score = lang_scores.get(best_lang, 0.0)
     non_en_score = sum(
         score for lang, score in lang_scores.items() if lang not in {"unknown", "en"}
     )
     en_score = lang_scores.get("en", 0.0)
 
+    # If English barely wins but there is a recent non-English preference, keep non-English.
     if best_lang == "en" and best_non_en_candidate:
         if non_en_score > 0 and en_score < non_en_score * 1.5:
             return (
@@ -470,6 +479,7 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
     if best_lang == "en":
         return "en", "latin", latest_text
 
+    # for non-English dominant language, use most recent detection of that language
     for item in reversed(detections):
         if (item.get("lang") or "").lower().strip() == best_lang:
             return (
@@ -504,9 +514,10 @@ async def detect_language_and_translate_to_english(
                     "role": "system",
                     "content": (
                         "You are a highly careful customer-support translation engine.\n"
-                        "Your job is to translate noisy customer messages into English.\n\n"
+                        "Your job is to translate noisy support-chat messages into English.\n\n"
+                        "The writer may be a customer or an agent.\n"
                         "The customer may write in English, Hindi, Urdu, Hinglish, Roman Hindi, Roman Urdu, "
-                        "or mixed English + roman text.\n\n"
+                        "Indonesian, or mixed English + roman text.\n\n"
                         "Important rules:\n"
                         "- Return ONLY valid JSON.\n"
                         "- Use recent chat context to resolve short or ambiguous replies.\n"
@@ -572,20 +583,19 @@ async def detect_language_and_translate_to_english(
         )
 
 
-async def normalize_agent_reply_to_english(
+async def detect_agent_language_and_prepare_translations(
     text: str,
     chat_id: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    Returns:
-        (detected_language_code, english_text)
+    Returns (source_language, translation_en, translation_id)
+    source_language is expected to be en, id, or unknown.
     """
     if not text.strip():
-        return "unknown", text
+        return "unknown", text, text
 
     start = time.perf_counter()
     context_block = build_context_block(chat_id)
-    normalized_text = normalize_roman_support_text(text)
 
     try:
         resp = await openai_client.chat.completions.create(
@@ -594,20 +604,23 @@ async def normalize_agent_reply_to_english(
                 {
                     "role": "system",
                     "content": (
-                        "You are a careful customer-support language normalization engine.\n"
-                        "Your job is to detect the language of the AGENT_MESSAGE and convert it into clear English.\n\n"
+                        "You analyze support-agent replies.\n"
+                        "The agent normally writes in either English or Indonesian.\n"
+                        "Determine which language the reply is primarily written in, "
+                        "then provide both an English and an Indonesian version.\n\n"
                         "Important rules:\n"
-                        "- The agent may write in English, Indonesian, Hindi, Urdu, Hinglish, Roman Urdu, or mixed text.\n"
-                        "- Preserve the intended customer-support meaning exactly.\n"
-                        "- Use recent chat context to resolve short replies like 'try now', 'already sent', 'please check', etc.\n"
-                        "- If the text is already English, keep it in natural English.\n"
-                        "- Do NOT invent proper nouns, payment methods, product names, or account details.\n"
-                        "- Return ONLY valid JSON.\n\n"
+                        "- Return ONLY valid JSON.\n"
+                        "- source_language must be exactly one of: en, id, unknown.\n"
+                        "- Use recent chat context to resolve short or ambiguous replies.\n"
+                        "- Keep the support meaning intact.\n"
+                        "- Do NOT invent details, product names, or proper nouns.\n"
+                        "- If the text is already English, translation_en should stay natural English.\n"
+                        "- If the text is already Indonesian, translation_id should stay natural Indonesian.\n\n"
                         "Return JSON in this exact shape:\n"
                         "{"
-                        "\"language\": \"<ISO 639-1 code like en, id, hi, ur>\", "
-                        "\"translation_en\": \"<best English normalization>\", "
-                        "\"confidence\": <number from 0 to 1>"
+                        "\"source_language\": \"en|id|unknown\", "
+                        "\"translation_en\": \"<best English rendering>\", "
+                        "\"translation_id\": \"<best Indonesian rendering>\""
                         "}"
                     ),
                 },
@@ -615,8 +628,7 @@ async def normalize_agent_reply_to_english(
                     "role": "user",
                     "content": (
                         f"{context_block}\n\n"
-                        f"AGENT_MESSAGE_RAW: {text}\n"
-                        f"AGENT_MESSAGE_NORMALIZED_HINT: {normalized_text}"
+                        f"AGENT_REPLY: {text}"
                     ),
                 },
             ],
@@ -624,34 +636,41 @@ async def normalize_agent_reply_to_english(
         )
 
         content = (resp.choices[0].message.content or "").strip()
-        print("OpenAI raw normalize_agent_reply_to_english response:", content)
+        print("OpenAI raw agent analyze response:", content)
 
         data = safe_json_loads(content)
         if not data:
-            print("Failed to parse JSON in normalize_agent_reply_to_english")
-            return "unknown", text
+            print("Failed to parse JSON from agent analyze response")
+            raise ValueError("invalid agent analyze json")
 
-        detected_lang = (data.get("language") or "unknown").lower().strip()
-        english_text = (data.get("translation_en") or "").strip()
+        source_language = (data.get("source_language") or "unknown").lower().strip()
+        if source_language not in {"en", "id", "unknown"}:
+            source_language = "unknown"
 
-        if not english_text:
-            english_text = text
+        translation_en = (data.get("translation_en") or "").strip() or text
+        translation_id = (data.get("translation_id") or "").strip() or text
 
-        return detected_lang, english_text
+        return source_language, translation_en, translation_id
 
     except APITimeoutError as e:
-        print("OpenAI timeout in normalize_agent_reply_to_english:", repr(e))
-        return "unknown", text
+        print("OpenAI timeout in detect_agent_language_and_prepare_translations:", repr(e))
 
     except Exception as e:
-        print("OpenAI error in normalize_agent_reply_to_english:", repr(e))
-        return "unknown", text
+        print("OpenAI error in detect_agent_language_and_prepare_translations:", repr(e))
 
     finally:
         print(
-            f"normalize_agent_reply_to_english took "
+            f"detect_agent_language_and_prepare_translations took "
             f"{time.perf_counter() - start:.2f}s"
         )
+
+    (fallback_lang, fallback_en, _), fallback_id = await asyncio.gather(
+        detect_language_and_translate_to_english(text, chat_id),
+        translate_to_indonesian(text, chat_id),
+    )
+    if fallback_lang not in {"en", "id"}:
+        fallback_lang = "unknown"
+    return fallback_lang, fallback_en, fallback_id
 
 
 async def translate_to_indonesian(text: str, chat_id: str) -> str:
@@ -705,29 +724,6 @@ async def translate_to_indonesian(text: str, chat_id: str) -> str:
 
     finally:
         print(f"translate_to_indonesian took {time.perf_counter() - start:.2f}s")
-
-
-async def translate_text_to_agent_language(
-    original_text: str,
-    translated_en: str,
-    agent_lang: str,
-    chat_id: str,
-) -> tuple[str, str]:
-    """
-    Returns:
-        (label, translated_text)
-
-    label examples:
-        EN, ID
-    """
-    agent_lang = (agent_lang or "en").lower().strip()
-
-    if agent_lang == "id":
-        translated_id = await translate_to_indonesian(original_text, chat_id)
-        return "ID", translated_id
-
-    # default = English
-    return "EN", translated_en
 
 
 async def repair_to_required_script(
@@ -792,14 +788,15 @@ async def repair_to_required_script(
 
 
 async def translate_agent_reply_to_customer(
-    agent_english_text: str,
+    agent_text: str,
+    source_lang_hint: str,
     sample_customer_text: str,
     target_lang: str,
     target_script: str,
     chat_id: str,
 ) -> str:
-    if not agent_english_text.strip():
-        return agent_english_text
+    if not agent_text.strip():
+        return agent_text
 
     start = time.perf_counter()
 
@@ -839,14 +836,14 @@ async def translate_agent_reply_to_customer(
                             "role": "system",
                             "content": (
                                 "You are a highly careful customer-support translation engine.\n"
-                                "Translate AGENT_REPLY_ENGLISH into the same language as CUSTOMER_TEXT.\n"
+                                "Translate AGENT_REPLY into the same language as CUSTOMER_TEXT.\n"
                                 "You MUST obey the required script exactly.\n"
                                 "Use recent chat context to keep the reply aligned with the ongoing conversation.\n\n"
+                                f"SOURCE_LANGUAGE_HINT: {source_lang_hint or 'unknown'}\n"
                                 f"TARGET_LANGUAGE: {target_lang}\n"
                                 f"TARGET_SCRIPT: {target_script}\n\n"
                                 f"{script_rule}\n"
                                 "Important rules:\n"
-                                "- AGENT_REPLY_ENGLISH is already English.\n"
                                 "- Keep the original customer-support meaning intact.\n"
                                 "- If the customer's style is romanized, keep the reply romanized.\n"
                                 "- For latin target script, do not suddenly switch into Hindi or Urdu script.\n"
@@ -865,7 +862,7 @@ async def translate_agent_reply_to_customer(
                             "content": (
                                 f"{context_block}\n\n"
                                 f"CUSTOMER_TEXT: {sample_customer_text}\n"
-                                f"AGENT_REPLY_ENGLISH: {agent_english_text}"
+                                f"AGENT_REPLY: {agent_text}"
                             ),
                         },
                     ],
@@ -913,8 +910,8 @@ async def translate_agent_reply_to_customer(
             except Exception as e:
                 print("OpenAI error in translate_agent_reply_to_customer attempt:", repr(e))
 
-        print("All translation attempts failed script validation; falling back to original English agent text")
-        return agent_english_text
+        print("All translation attempts failed script validation; falling back to original agent text")
+        return agent_text
 
     finally:
         print(
@@ -963,12 +960,12 @@ async def post_livechat_event(payload: dict, label: str) -> bool:
         print(f"{label} took {time.perf_counter() - start:.2f}s")
 
 
-async def send_agent_only_message(chat_id: str, text: str, label_prefix: str = "EN") -> bool:
+async def send_agent_only_message(chat_id: str, text: str) -> bool:
     payload = {
         "chat_id": chat_id,
         "event": {
             "type": "message",
-            "text": f"[{label_prefix}] {text}",
+            "text": f"[EN] {text}",
             "visibility": "agents",
             "custom_id": "translator-bot",
         },
@@ -1031,13 +1028,20 @@ async def process_livechat_event(body: dict):
         if author_type == "visitor":
             print("Visitor message:", text)
 
-            detected_lang, translated_en, detected_script = await detect_language_and_translate_to_english(
-                text,
-                chat_id,
+            (
+                (detected_lang, translated_en, detected_script),
+                translated_id,
+            ) = await asyncio.gather(
+                detect_language_and_translate_to_english(
+                    text,
+                    chat_id,
+                ),
+                translate_to_indonesian(text, chat_id),
             )
             print(f"Detected language for chat {chat_id}: {detected_lang}")
             print(f"Detected script for chat {chat_id}: {detected_script}")
             print("English translation:", translated_en)
+            print("Indonesian translation:", translated_id)
 
             append_visitor_detection(chat_id, detected_lang, detected_script, text)
 
@@ -1051,23 +1055,11 @@ async def process_livechat_event(body: dict):
             state["script"] = effective_script
             state["sample"] = effective_sample or text
 
-            agent_lang = state.get("agent_lang", "en")
-            label_prefix, internal_text = await translate_text_to_agent_language(
-                original_text=text,
-                translated_en=translated_en,
-                agent_lang=agent_lang,
-                chat_id=chat_id,
-            )
-            print(f"Agent preferred language for chat {chat_id}: {agent_lang}")
-            print(f"Internal note label for agent: {label_prefix}")
-            print(f"Internal note text for agent: {internal_text}")
+            ok_en = await send_agent_only_message(chat_id, translated_en)
+            print("Agent-only EN note sent:", ok_en)
 
-            ok_agent_note = await send_agent_only_message(
-                chat_id,
-                internal_text,
-                label_prefix=label_prefix,
-            )
-            print("Agent-only note sent:", ok_agent_note)
+            ok_id = await send_agent_only_message_id(chat_id, translated_id)
+            print("Agent-only ID note sent:", ok_id)
 
             return
 
@@ -1077,51 +1069,58 @@ async def process_livechat_event(body: dict):
 
             chat_state = CHAT_STATE.get(chat_id)
             if not chat_state:
-                chat_state = get_or_create_chat_state(chat_id)
+                print("No stored language for this chat, skipping agent translation.")
+                return
 
             lang = chat_state.get("lang", "unknown")
             script = chat_state.get("script", "other")
             sample = chat_state.get("sample", "")
 
-            detected_agent_lang, agent_english_text = await normalize_agent_reply_to_english(
-                text,
-                chat_id,
+            agent_source_lang, translated_en, translated_id = (
+                await detect_agent_language_and_prepare_translations(text, chat_id)
             )
-            print(f"Detected agent language for chat {chat_id}: {detected_agent_lang}")
-            print("Normalized agent English:", agent_english_text)
-
-            if not chat_state.get("agent_lang_locked", False):
-                chosen_agent_lang = detected_agent_lang if detected_agent_lang in {"en", "id"} else "en"
-                chat_state["agent_lang"] = chosen_agent_lang
-                chat_state["agent_lang_locked"] = True
-                print(f"Locked agent language for chat {chat_id}: {chosen_agent_lang}")
-            else:
-                print(f"Agent language already locked for chat {chat_id}: {chat_state.get('agent_lang')}")
-
-            # If dominant client language is English, no need visitor translation.
-            if lang == "en":
-                print("Dominant client language is English; not translating agent reply to visitor.")
-                return
-
-            translated_reply = await translate_agent_reply_to_customer(
-                agent_english_text,
-                sample,
-                lang,
-                script,
-                chat_id,
-            )
-            print("Translated agent reply for visitor:", translated_reply)
-
-            # Keep current Indonesian internal note behavior for agent messages.
-            if detected_agent_lang == "id":
-                translated_id = text
-            else:
-                translated_id = await translate_to_indonesian(agent_english_text, chat_id)
-
+            print(f"Agent source language for chat {chat_id}: {agent_source_lang}")
+            print("Agent message English translation:", translated_en)
             print("Agent message Indonesian translation:", translated_id)
 
-            ok_id = await send_agent_only_message_id(chat_id, translated_id)
-            print("Agent-only ID note sent for agent message:", ok_id)
+            if agent_source_lang == "id":
+                ok_en = await send_agent_only_message(chat_id, translated_en)
+                print("Agent-only EN note sent for agent message:", ok_en)
+            elif agent_source_lang == "en":
+                ok_id = await send_agent_only_message_id(chat_id, translated_id)
+                print("Agent-only ID note sent for agent message:", ok_id)
+            else:
+                ok_en = await send_agent_only_message(chat_id, translated_en)
+                ok_id = await send_agent_only_message_id(chat_id, translated_id)
+                print("Agent-only EN note sent for agent message:", ok_en)
+                print("Agent-only ID note sent for agent message:", ok_id)
+
+            if lang in {"", "unknown"}:
+                print("Stored dominant client language is unknown; skipping visitor translation.")
+                return
+
+            translated_reply: Optional[str] = None
+
+            if lang == "en":
+                if agent_source_lang == "en":
+                    print("Agent already replied in English for an English chat; skipping visitor translation.")
+                    return
+                translated_reply = translated_en
+            elif lang == "id":
+                if agent_source_lang == "id":
+                    print("Agent already replied in Indonesian for an Indonesian chat; skipping visitor translation.")
+                    return
+                translated_reply = translated_id
+            else:
+                translated_reply = await translate_agent_reply_to_customer(
+                    text,
+                    agent_source_lang,
+                    sample,
+                    lang,
+                    script,
+                    chat_id,
+                )
+            print("Translated agent reply for visitor:", translated_reply)
 
             if not matches_required_script(translated_reply, normalize_script_label(script)):
                 print("Blocked visitor message due to script mismatch after all attempts")
