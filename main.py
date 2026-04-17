@@ -273,9 +273,11 @@ def get_or_create_chat_state(chat_id: str) -> dict:
     state = CHAT_STATE.get(chat_id)
     if state is None:
         state = {
-            "lang": "unknown",  # effective dominant lang
-            "script": "other",  # effective dominant script
+            "lang": "unknown",  # effective dominant client language
+            "script": "other",  # effective dominant client script
             "sample": "",
+            "agent_lang": "en",  # agent preferred language
+            "agent_lang_locked": False,
             "recent_visitor_messages": [],
             "recent_agent_messages": [],
             "recent_visitor_detections": [],
@@ -390,10 +392,7 @@ def find_last_non_english_detection(detections: list[dict]) -> Optional[dict]:
 
 def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
     """
-    Dominant language logic:
-    - do not let one short English message flip the whole chat to English
-    - preserve prior non-English preference unless recent visitor behavior clearly changes
-    Returns: (effective_lang, effective_script, effective_sample)
+    Dominant client language logic.
     """
     state = get_or_create_chat_state(chat_id)
     detections = state.get("recent_visitor_detections", [])
@@ -406,13 +405,11 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
     latest_script = normalize_script_label(latest.get("script") or "other")
     latest_text = latest.get("text") or ""
 
-    # If latest message is clearly non-English, trust it immediately.
     if latest_lang not in {"unknown", "en"}:
         return latest_lang, latest_script, latest_text
 
     last_non_en = find_last_non_english_detection(detections)
 
-    # If latest message is English but short/generic, preserve previous non-English preference.
     if latest_lang == "en" and latest.get("is_short_generic_english") and last_non_en:
         return (
             last_non_en.get("lang") or "unknown",
@@ -420,7 +417,6 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
             last_non_en.get("text") or latest_text,
         )
 
-    # If there are two most recent meaningful English messages in a row, allow switch to English.
     if len(detections) >= 2:
         last_two = detections[-2:]
         if all(
@@ -430,14 +426,12 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
         ):
             return "en", "latin", latest_text
 
-    # Weighted voting across recent visitor detections.
     lang_scores: dict[str, float] = {}
     best_non_en_candidate: Optional[dict] = None
 
     total = len(detections)
     for idx, item in enumerate(detections):
         lang = (item.get("lang") or "unknown").lower().strip()
-        text = item.get("text") or ""
         is_short_en = bool(item.get("is_short_generic_english"))
 
         weight = float(idx + 1) / float(total)
@@ -453,13 +447,11 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
             best_non_en_candidate = item
 
     best_lang = max(lang_scores, key=lang_scores.get)
-    best_lang_score = lang_scores.get(best_lang, 0.0)
     non_en_score = sum(
         score for lang, score in lang_scores.items() if lang not in {"unknown", "en"}
     )
     en_score = lang_scores.get("en", 0.0)
 
-    # If English barely wins but there is a recent non-English preference, keep non-English.
     if best_lang == "en" and best_non_en_candidate:
         if non_en_score > 0 and en_score < non_en_score * 1.5:
             return (
@@ -478,7 +470,6 @@ def compute_effective_language_and_script(chat_id: str) -> tuple[str, str, str]:
     if best_lang == "en":
         return "en", "latin", latest_text
 
-    # for non-English dominant language, use most recent detection of that language
     for item in reversed(detections):
         if (item.get("lang") or "").lower().strip() == best_lang:
             return (
@@ -588,13 +579,7 @@ async def normalize_agent_reply_to_english(
     """
     Returns:
         (detected_language_code, english_text)
-
-    Reliable logic:
-    - If agent wrote English, keep it as-is.
-    - If agent wrote Indonesian, translate to English first.
-    - If agent wrote something else, still normalize to English conservatively.
     """
-
     if not text.strip():
         return "unknown", text
 
@@ -720,6 +705,29 @@ async def translate_to_indonesian(text: str, chat_id: str) -> str:
 
     finally:
         print(f"translate_to_indonesian took {time.perf_counter() - start:.2f}s")
+
+
+async def translate_text_to_agent_language(
+    original_text: str,
+    translated_en: str,
+    agent_lang: str,
+    chat_id: str,
+) -> tuple[str, str]:
+    """
+    Returns:
+        (label, translated_text)
+
+    label examples:
+        EN, ID
+    """
+    agent_lang = (agent_lang or "en").lower().strip()
+
+    if agent_lang == "id":
+        translated_id = await translate_to_indonesian(original_text, chat_id)
+        return "ID", translated_id
+
+    # default = English
+    return "EN", translated_en
 
 
 async def repair_to_required_script(
@@ -955,12 +963,12 @@ async def post_livechat_event(payload: dict, label: str) -> bool:
         print(f"{label} took {time.perf_counter() - start:.2f}s")
 
 
-async def send_agent_only_message(chat_id: str, text: str) -> bool:
+async def send_agent_only_message(chat_id: str, text: str, label_prefix: str = "EN") -> bool:
     payload = {
         "chat_id": chat_id,
         "event": {
             "type": "message",
-            "text": f"[EN] {text}",
+            "text": f"[{label_prefix}] {text}",
             "visibility": "agents",
             "custom_id": "translator-bot",
         },
@@ -1043,16 +1051,23 @@ async def process_livechat_event(body: dict):
             state["script"] = effective_script
             state["sample"] = effective_sample or text
 
-            # Keep current behavior pattern: internal EN/ID notes only for non-English detected messages.
-            if detected_lang != "en":
-                ok_en = await send_agent_only_message(chat_id, translated_en)
-                print("Agent-only EN note sent:", ok_en)
+            agent_lang = state.get("agent_lang", "en")
+            label_prefix, internal_text = await translate_text_to_agent_language(
+                original_text=text,
+                translated_en=translated_en,
+                agent_lang=agent_lang,
+                chat_id=chat_id,
+            )
+            print(f"Agent preferred language for chat {chat_id}: {agent_lang}")
+            print(f"Internal note label for agent: {label_prefix}")
+            print(f"Internal note text for agent: {internal_text}")
 
-                translated_id = await translate_to_indonesian(text, chat_id)
-                print("Indonesian translation:", translated_id)
-
-                ok_id = await send_agent_only_message_id(chat_id, translated_id)
-                print("Agent-only ID note sent:", ok_id)
+            ok_agent_note = await send_agent_only_message(
+                chat_id,
+                internal_text,
+                label_prefix=label_prefix,
+            )
+            print("Agent-only note sent:", ok_agent_note)
 
             return
 
@@ -1062,17 +1077,11 @@ async def process_livechat_event(body: dict):
 
             chat_state = CHAT_STATE.get(chat_id)
             if not chat_state:
-                print("No stored language for this chat, skipping agent translation.")
-                return
+                chat_state = get_or_create_chat_state(chat_id)
 
             lang = chat_state.get("lang", "unknown")
             script = chat_state.get("script", "other")
             sample = chat_state.get("sample", "")
-
-            # With dominant language logic, only skip if chat is truly dominant-English.
-            if lang == "en":
-                print("Dominant chat language is English; not translating agent reply.")
-                return
 
             detected_agent_lang, agent_english_text = await normalize_agent_reply_to_english(
                 text,
@@ -1080,6 +1089,19 @@ async def process_livechat_event(body: dict):
             )
             print(f"Detected agent language for chat {chat_id}: {detected_agent_lang}")
             print("Normalized agent English:", agent_english_text)
+
+            if not chat_state.get("agent_lang_locked", False):
+                chosen_agent_lang = detected_agent_lang if detected_agent_lang in {"en", "id"} else "en"
+                chat_state["agent_lang"] = chosen_agent_lang
+                chat_state["agent_lang_locked"] = True
+                print(f"Locked agent language for chat {chat_id}: {chosen_agent_lang}")
+            else:
+                print(f"Agent language already locked for chat {chat_id}: {chat_state.get('agent_lang')}")
+
+            # If dominant client language is English, no need visitor translation.
+            if lang == "en":
+                print("Dominant client language is English; not translating agent reply to visitor.")
+                return
 
             translated_reply = await translate_agent_reply_to_customer(
                 agent_english_text,
@@ -1090,8 +1112,7 @@ async def process_livechat_event(body: dict):
             )
             print("Translated agent reply for visitor:", translated_reply)
 
-            # Keep current internal Indonesian note behavior,
-            # but avoid unnecessary re-translation if agent already wrote Indonesian.
+            # Keep current Indonesian internal note behavior for agent messages.
             if detected_agent_lang == "id":
                 translated_id = text
             else:
