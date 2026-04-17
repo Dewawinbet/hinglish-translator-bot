@@ -581,6 +581,94 @@ async def detect_language_and_translate_to_english(
         )
 
 
+async def normalize_agent_reply_to_english(
+    text: str,
+    chat_id: str,
+) -> tuple[str, str]:
+    """
+    Returns:
+        (detected_language_code, english_text)
+
+    Reliable logic:
+    - If agent wrote English, keep it as-is.
+    - If agent wrote Indonesian, translate to English first.
+    - If agent wrote something else, still normalize to English conservatively.
+    """
+
+    if not text.strip():
+        return "unknown", text
+
+    start = time.perf_counter()
+    context_block = build_context_block(chat_id)
+    normalized_text = normalize_roman_support_text(text)
+
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful customer-support language normalization engine.\n"
+                        "Your job is to detect the language of the AGENT_MESSAGE and convert it into clear English.\n\n"
+                        "Important rules:\n"
+                        "- The agent may write in English, Indonesian, Hindi, Urdu, Hinglish, Roman Urdu, or mixed text.\n"
+                        "- Preserve the intended customer-support meaning exactly.\n"
+                        "- Use recent chat context to resolve short replies like 'try now', 'already sent', 'please check', etc.\n"
+                        "- If the text is already English, keep it in natural English.\n"
+                        "- Do NOT invent proper nouns, payment methods, product names, or account details.\n"
+                        "- Return ONLY valid JSON.\n\n"
+                        "Return JSON in this exact shape:\n"
+                        "{"
+                        "\"language\": \"<ISO 639-1 code like en, id, hi, ur>\", "
+                        "\"translation_en\": \"<best English normalization>\", "
+                        "\"confidence\": <number from 0 to 1>"
+                        "}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{context_block}\n\n"
+                        f"AGENT_MESSAGE_RAW: {text}\n"
+                        f"AGENT_MESSAGE_NORMALIZED_HINT: {normalized_text}"
+                    ),
+                },
+            ],
+            temperature=0,
+        )
+
+        content = (resp.choices[0].message.content or "").strip()
+        print("OpenAI raw normalize_agent_reply_to_english response:", content)
+
+        data = safe_json_loads(content)
+        if not data:
+            print("Failed to parse JSON in normalize_agent_reply_to_english")
+            return "unknown", text
+
+        detected_lang = (data.get("language") or "unknown").lower().strip()
+        english_text = (data.get("translation_en") or "").strip()
+
+        if not english_text:
+            english_text = text
+
+        return detected_lang, english_text
+
+    except APITimeoutError as e:
+        print("OpenAI timeout in normalize_agent_reply_to_english:", repr(e))
+        return "unknown", text
+
+    except Exception as e:
+        print("OpenAI error in normalize_agent_reply_to_english:", repr(e))
+        return "unknown", text
+
+    finally:
+        print(
+            f"normalize_agent_reply_to_english took "
+            f"{time.perf_counter() - start:.2f}s"
+        )
+
+
 async def translate_to_indonesian(text: str, chat_id: str) -> str:
     if not text.strip():
         return text
@@ -696,14 +784,14 @@ async def repair_to_required_script(
 
 
 async def translate_agent_reply_to_customer(
-    agent_text: str,
+    agent_english_text: str,
     sample_customer_text: str,
     target_lang: str,
     target_script: str,
     chat_id: str,
 ) -> str:
-    if not agent_text.strip():
-        return agent_text
+    if not agent_english_text.strip():
+        return agent_english_text
 
     start = time.perf_counter()
 
@@ -743,13 +831,14 @@ async def translate_agent_reply_to_customer(
                             "role": "system",
                             "content": (
                                 "You are a highly careful customer-support translation engine.\n"
-                                "Translate AGENT_REPLY into the same language as CUSTOMER_TEXT.\n"
+                                "Translate AGENT_REPLY_ENGLISH into the same language as CUSTOMER_TEXT.\n"
                                 "You MUST obey the required script exactly.\n"
                                 "Use recent chat context to keep the reply aligned with the ongoing conversation.\n\n"
                                 f"TARGET_LANGUAGE: {target_lang}\n"
                                 f"TARGET_SCRIPT: {target_script}\n\n"
                                 f"{script_rule}\n"
                                 "Important rules:\n"
+                                "- AGENT_REPLY_ENGLISH is already English.\n"
                                 "- Keep the original customer-support meaning intact.\n"
                                 "- If the customer's style is romanized, keep the reply romanized.\n"
                                 "- For latin target script, do not suddenly switch into Hindi or Urdu script.\n"
@@ -768,7 +857,7 @@ async def translate_agent_reply_to_customer(
                             "content": (
                                 f"{context_block}\n\n"
                                 f"CUSTOMER_TEXT: {sample_customer_text}\n"
-                                f"AGENT_REPLY (English): {agent_text}"
+                                f"AGENT_REPLY_ENGLISH: {agent_english_text}"
                             ),
                         },
                     ],
@@ -816,8 +905,8 @@ async def translate_agent_reply_to_customer(
             except Exception as e:
                 print("OpenAI error in translate_agent_reply_to_customer attempt:", repr(e))
 
-        print("All translation attempts failed script validation; falling back to original agent text")
-        return agent_text
+        print("All translation attempts failed script validation; falling back to original English agent text")
+        return agent_english_text
 
     finally:
         print(
@@ -985,8 +1074,15 @@ async def process_livechat_event(body: dict):
                 print("Dominant chat language is English; not translating agent reply.")
                 return
 
-            translated_reply = await translate_agent_reply_to_customer(
+            detected_agent_lang, agent_english_text = await normalize_agent_reply_to_english(
                 text,
+                chat_id,
+            )
+            print(f"Detected agent language for chat {chat_id}: {detected_agent_lang}")
+            print("Normalized agent English:", agent_english_text)
+
+            translated_reply = await translate_agent_reply_to_customer(
+                agent_english_text,
                 sample,
                 lang,
                 script,
@@ -994,7 +1090,13 @@ async def process_livechat_event(body: dict):
             )
             print("Translated agent reply for visitor:", translated_reply)
 
-            translated_id = await translate_to_indonesian(text, chat_id)
+            # Keep current internal Indonesian note behavior,
+            # but avoid unnecessary re-translation if agent already wrote Indonesian.
+            if detected_agent_lang == "id":
+                translated_id = text
+            else:
+                translated_id = await translate_to_indonesian(agent_english_text, chat_id)
+
             print("Agent message Indonesian translation:", translated_id)
 
             ok_id = await send_agent_only_message_id(chat_id, translated_id)
